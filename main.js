@@ -87,7 +87,7 @@ assets.face.src = "./assets/face.png";
 assets.faceHit.src = "./assets/face_hit.png"; // if missing, copy face.png
 
 // ====== audio (optional) ======
-const SOUND_ENABLED = true; // ←原因切り分けしたい時は false にして試して
+const SOUND_ENABLED = false; // ←原因切り分けしたい時は false にして試して
 const audio = {
   bgm: null,
   hit01: null,
