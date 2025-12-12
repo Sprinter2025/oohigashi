@@ -1,7 +1,8 @@
-// main.js (FULL COPY-PASTE)  --- Mobile lightweight ver ---
+// main.js (FULL COPY-PASTE)  --- Mobile lightweight ver (particle sprite) ---
 // - iOS Safari bottom bar safe: use visualViewport for sizing
 // - Tap hitbox bigger on mobile
 // - Performance: cap DPR to 2, reduce particles/floaters, thinner strokes on mobile
+// - Particles: use pre-rendered sprite + MAX_PARTICLES cap (fast)
 // - Sounds: throttle SE on mobile (avoid audio spam stutter)
 
 const canvas = document.getElementById("game");
@@ -42,6 +43,29 @@ function fitCanvas() {
 window.addEventListener("resize", fitCanvas);
 window.visualViewport?.addEventListener("resize", fitCanvas);
 fitCanvas();
+
+// ---- particle sprite (fast) ----
+let dotSprite = null;
+function makeDotSprite() {
+  const c = document.createElement("canvas");
+  c.width = 32;
+  c.height = 32;
+  const g = c.getContext("2d");
+
+  const cx = 16, cy = 16;
+  const grad = g.createRadialGradient(cx, cy, 0, cx, cy, 16);
+  grad.addColorStop(0.0, "rgba(255,255,255,1.0)");
+  grad.addColorStop(0.5, "rgba(255,255,255,0.65)");
+  grad.addColorStop(1.0, "rgba(255,255,255,0.0)");
+
+  g.fillStyle = grad;
+  g.beginPath();
+  g.arc(cx, cy, 16, 0, Math.PI * 2);
+  g.fill();
+
+  dotSprite = c;
+}
+makeDotSprite();
 
 const assets = {
   face: new Image(),
@@ -257,16 +281,24 @@ function resetGameForIntro(introSeconds) {
   elTime.textContent = GAME_SECONDS.toFixed(1);
 }
 
+// ---- particles: cap + shorter life ----
+const MAX_PARTICLES = IS_MOBILE ? 60 : 220;
+
 function spawnParticles(x, y, n = 18) {
-  const nn = IS_MOBILE ? Math.max(6, Math.floor(n * 0.5)) : n;
+  if (state.particles.length >= MAX_PARTICLES) return;
+
+  const nn = IS_MOBILE ? Math.max(4, Math.floor(n * 0.35)) : n;
+
   for (let i = 0; i < nn; i++) {
+    if (state.particles.length >= MAX_PARTICLES) break;
+
     const a = rand(0, Math.PI * 2);
     const sp = rand(140, 620);
     state.particles.push({
       x, y,
       vx: Math.cos(a) * sp,
       vy: Math.sin(a) * sp,
-      life: rand(0.22, 0.55),
+      life: rand(0.18, 0.42),
       t: 0
     });
   }
@@ -616,15 +648,17 @@ function draw() {
   ctx.fillStyle = "#0b0f1a";
   ctx.fillRect(0, 0, w, h);
 
-  for (const p of state.particles) {
-    const a = 1 - (p.t / p.life);
-    ctx.globalAlpha = a;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 4 + 7 * a, 0, Math.PI * 2);
-    ctx.fillStyle = "#ffffff";
-    ctx.fill();
+  // ---- particles: sprite draw (fast) ----
+  if (dotSprite) {
+    for (const p of state.particles) {
+      const a = 1 - (p.t / p.life);
+      ctx.globalAlpha = a;
+
+      const r = (IS_MOBILE ? 8 : 10) * a + 2; // 2..12
+      ctx.drawImage(dotSprite, p.x - r, p.y - r, r * 2, r * 2);
+    }
+    ctx.globalAlpha = 1;
   }
-  ctx.globalAlpha = 1;
 
   for (const ft of state.floaters) {
     const p = ft.t / ft.life;
@@ -728,6 +762,6 @@ function loop(t) {
 
 // initial overlay
 overlay.classList.remove("hidden");
-titleEl.textContent = "Face Bop";
+titleEl.textContent = "Atack Oohigashi!!";
 resultEl.textContent = "STARTを押してね";
 btn.textContent = "START";
