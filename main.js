@@ -5,9 +5,9 @@
 // - Particles: pre-rendered sprite + MAX_PARTICLES cap (fast)
 // - Floaters/Particles: in-place compaction (NO Array.filter allocations)
 // - Sounds: WebAudio (AudioBuffer) + throttle (fix tap-stutter)
-// - Background: light gray
-// - HUD text: black
-// - Enemy shadow: visible gray (not blended)
+// - Colors: revert to dark background scheme (like old black BG)
+// - Mobile: character speed x0.5
+// - Shadow: slightly whitish
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -37,7 +37,7 @@ function getViewportSize() {
 
 function fitCanvas() {
   const { w, h } = getViewportSize();
-  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1)); // cap for performance
+  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
   canvas.style.width = w + "px";
   canvas.style.height = h + "px";
   canvas.width = Math.floor(w * dpr);
@@ -103,7 +103,6 @@ async function ensureAudio() {
     return await audioCtx.decodeAudioData(arr);
   }
 
-  // decode once
   const [b1, b2, b3, b4] = await Promise.all([
     loadBuf("./assets/hit01.mp3"),
     loadBuf("./assets/hit02.mp3"),
@@ -118,8 +117,7 @@ async function ensureAudio() {
 
 function startBGM() {
   if (!audioCtx || !buffers.bgm) return;
-  if (bgmSource) return; // already playing
-
+  if (bgmSource) return;
   bgmSource = audioCtx.createBufferSource();
   bgmSource.buffer = buffers.bgm;
   bgmSource.loop = true;
@@ -132,14 +130,12 @@ function playSE(buf, volMul = 1.0) {
   if (!audioCtx || !buf) return;
 
   const now = performance.now();
-  // throttle to avoid audio spam stutter
-  if (IS_MOBILE && now - lastSeTime < 70) return;
+  if (IS_MOBILE && now - lastSeTime < 70) return; // throttle
   lastSeTime = now;
 
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
 
-  // per-hit gain (cheap)
   const g = audioCtx.createGain();
   g.gain.value = volMul;
   src.connect(g);
@@ -166,14 +162,15 @@ const GAME_SECONDS = 30.0;
 function speedLimit() {
   const { w, h } = getViewportSize();
   const s = Math.min(w, h);
-  return clamp(s * 0.85, 520, 900); // px/s
+  const base = clamp(s * 0.85, 520, 900);
+  return IS_MOBILE ? base * 0.5 : base; // ★スマホは0.5倍
 }
 
 const state = {
   running: false,
   lastT: 0,
 
-  phase: "intro", // "intro" -> "play"
+  phase: "intro",
   introLeft: INTRO_FIRST_SECONDS,
   introTotal: INTRO_FIRST_SECONDS,
   countPlayed: false,
@@ -182,7 +179,6 @@ const state = {
   score: 0,
   timeLeft: GAME_SECONDS,
 
-  // pooled arrays (in-place compaction)
   particles: [],
   floaters: [],
 
@@ -210,7 +206,7 @@ const state = {
 
 let hasStartedOnce = false;
 
-// ---- floaters (pool + cap) ----
+// ---- floaters ----
 const MAX_FLOATERS = IS_MOBILE ? 18 : 60;
 
 function addFloater(text, x, y, opts = {}) {
@@ -271,7 +267,6 @@ function resetGameForIntro(introSeconds) {
   state.score = 0;
   state.timeLeft = GAME_SECONDS;
 
-  // clear arrays without realloc
   state.particles.length = 0;
   state.floaters.length = 0;
 
@@ -287,8 +282,11 @@ function resetGameForIntro(introSeconds) {
   state.face.x = rand(state.face.r, w - state.face.r);
   state.face.y = rand(state.face.r + 90, h - state.face.r);
 
-  const baseVx = rand(220, 340) * (Math.random() < 0.5 ? -1 : 1);
-  const baseVy = rand(180, 300) * (Math.random() < 0.5 ? -1 : 1);
+  // ★スマホは動き0.5倍
+  const spMul = IS_MOBILE ? 0.5 : 1.0;
+
+  const baseVx = rand(220, 340) * spMul * (Math.random() < 0.5 ? -1 : 1);
+  const baseVy = rand(180, 300) * spMul * (Math.random() < 0.5 ? -1 : 1);
   state.face.baseVx = baseVx;
   state.face.baseVy = baseVy;
 
@@ -301,7 +299,7 @@ function resetGameForIntro(introSeconds) {
   elTime.textContent = GAME_SECONDS.toFixed(1);
 }
 
-// ---- particles (cap + in-place update) ----
+// ---- particles ----
 const MAX_PARTICLES = IS_MOBILE ? 60 : 220;
 
 function spawnParticles(x, y, n = 18) {
@@ -313,7 +311,7 @@ function spawnParticles(x, y, n = 18) {
     if (state.particles.length >= MAX_PARTICLES) break;
 
     const a = rand(0, Math.PI * 2);
-    const sp = rand(140, 620);
+    const sp = rand(140, 620) * (IS_MOBILE ? 0.8 : 1.0);
     state.particles.push({
       x, y,
       vx: Math.cos(a) * sp,
@@ -349,7 +347,6 @@ function endGame() {
 }
 
 async function startGame() {
-  // IMPORTANT: must be called from user gesture
   await ensureAudio();
   if (audioCtx.state === "suspended") {
     try { await audioCtx.resume(); } catch (_) {}
@@ -404,10 +401,8 @@ canvas.addEventListener("pointerdown", (e) => {
       size: IS_MOBILE ? 24 : 28, life: 0.60, rise: 120, wobble: 8, weight: 900
     });
 
-    // hit SE
     playHitNormal();
 
-    // 5 combo bonus
     if (state.combo === 5) {
       const bonus = 10 * state.scoreMul;
       state.score += bonus;
@@ -450,7 +445,7 @@ canvas.addEventListener("pointerdown", (e) => {
   }
 }, { passive: true });
 
-// ---- update helpers: in-place compaction (no filter) ----
+// ---- update helpers: in-place compaction ----
 function updateParticles(dt) {
   const arr = state.particles;
   let w = 0;
@@ -483,7 +478,6 @@ function updateFloaters(dt) {
 }
 
 function update(dt) {
-  // intro
   if (state.phase === "intro") {
     if (state.goHold > 0) {
       state.goHold = Math.max(0, state.goHold - dt);
@@ -526,7 +520,6 @@ function update(dt) {
     return;
   }
 
-  // play
   state.timeLeft -= dt;
   if (state.timeLeft <= 0) {
     state.timeLeft = 0;
@@ -571,7 +564,6 @@ function drawIntroCountdown() {
   const { w, h } = getViewportSize();
   const left = state.introLeft;
 
-  // 最初の2秒(7→5)は数字を表示しない
   const waiting = (left > 5.0);
   const n = Math.max(0, Math.min(5, Math.ceil(left)));
   const isGo = (left <= 0.0);
@@ -580,13 +572,15 @@ function drawIntroCountdown() {
   const pulse = 1 + 0.08 * Math.sin((1 - p) * Math.PI * 6);
 
   ctx.save();
-  ctx.globalAlpha = 0.98;
+  ctx.globalAlpha = 0.95;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
-  // GET READY
   ctx.font = `900 24px system-ui, sans-serif`;
-  ctx.fillStyle = "rgba(0,0,0,0.88)";
+  // shadow
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillText("GET READY", w / 2 + 2, h / 2 - 110 + 2);
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
   ctx.fillText("GET READY", w / 2, h / 2 - 110);
 
   if (waiting) { ctx.restore(); return; }
@@ -594,15 +588,17 @@ function drawIntroCountdown() {
   const text = isGo ? "GO!" : String(n);
 
   ctx.font = `${Math.floor((IS_MOBILE ? 100 : 120) * pulse)}px system-ui, sans-serif`;
-  ctx.fillStyle = "rgba(0,0,0,0.92)";
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillText(text, w / 2 + 3, h / 2 + 3);
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
   ctx.fillText(text, w / 2, h / 2);
 
   ctx.restore();
 }
 
 // ---- draw ----
-const BG_COLOR = "#d6d6d6"; // 薄いグレー（背景）
-const HUD_COLOR = "rgba(0,0,0,0.92)";
+const BG_COLOR = "#0b0f1a";            // ★黒背景に戻す
+const HUD_COLOR = "rgba(255,255,255,0.96)";
 
 function draw() {
   const { w, h } = getViewportSize();
@@ -628,14 +624,13 @@ function draw() {
       const p = state.particles[i];
       const a = 1 - (p.t / p.life);
       ctx.globalAlpha = a;
-
       const r = (IS_MOBILE ? 8 : 10) * a + 2;
       ctx.drawImage(dotSprite, p.x - r, p.y - r, r * 2, r * 2);
     }
     ctx.globalAlpha = 1;
   }
 
-  // floaters (mobile: fill only)
+  // floaters (white like old scheme)
   for (let i = 0; i < state.floaters.length; i++) {
     const ft = state.floaters[i];
     const p = ft.t / ft.life;
@@ -649,11 +644,11 @@ function draw() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
 
-    // shadow-like (cheap): draw slightly offset
-    ctx.fillStyle = "rgba(0,0,0,0.25)";
+    // cheap shadow
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
     ctx.fillText(ft.text, xx + 2, yy + 2);
 
-    ctx.fillStyle = "rgba(0,0,0,0.92)";
+    ctx.fillStyle = "rgba(255,255,255,0.98)";
     ctx.fillText(ft.text, xx, yy);
   }
   ctx.globalAlpha = 1;
@@ -665,11 +660,11 @@ function draw() {
   const pop = (f.scalePop > 0) ? (1 + 0.18 * (f.scalePop / 0.20)) : 1;
   const size = (f.r * 2) * pop;
 
-  // ---- shadow: visible gray on gray background ----
-  ctx.globalAlpha = 0.55;
+  // ---- shadow: slightly whitish ----
+  ctx.globalAlpha = 0.26;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(90,90,90,0.55)"; // 影をグレー寄りにして背景に同化しない
+  ctx.fillStyle = "rgba(255,255,255,0.22)"; // ★ちょっと白寄り
   ctx.fill();
   ctx.globalAlpha = 1;
 
@@ -681,7 +676,7 @@ function draw() {
   ctx.restore();
 
   ctx.lineWidth = 4;
-  ctx.strokeStyle = "rgba(0,0,0,0.18)";
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
   ctx.beginPath();
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
   ctx.stroke();
@@ -692,9 +687,9 @@ function draw() {
 
   ctx.restore();
 
-  // HUD (right top)
+  // HUD (right top, white like old scheme)
   ctx.save();
-  ctx.globalAlpha = 0.98;
+  ctx.globalAlpha = 0.95;
   ctx.textAlign = "right";
   ctx.textBaseline = "top";
 
@@ -705,8 +700,7 @@ function draw() {
 
   function drawHudText(text, x, y, font) {
     ctx.font = font;
-    // cheap shadow (no stroke)
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
     ctx.fillText(text, x + 2, y + 2);
     ctx.fillStyle = HUD_COLOR;
     ctx.fillText(text, x, y);
