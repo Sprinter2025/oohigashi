@@ -2,12 +2,10 @@
 // - iOS Safari bottom bar safe: use visualViewport for sizing
 // - Tap hitbox bigger on mobile
 // - Performance: cap DPR to 2, reduce particles/floaters, thinner strokes on mobile
-// - Particles: sprite + pool (no GC burst)
-// - Floaters: pool (no GC burst)
-// - Input: queue taps, process max 1 per frame
-// - DOM: score update once per frame
-// - Background: pale gray
-// - Sounds: audio pool + throttle
+// - Particles: use pre-rendered sprite + MAX_PARTICLES cap (fast)
+// - Sounds: audio pool + throttle (avoid audio spam stutter)
+// - FIX: frame-synced hit (max 1 hit processed per frame) => prevents rapid tap lag
+// - UI: background darker gray, HUD text black
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -37,7 +35,7 @@ function getViewportSize() {
 
 function fitCanvas() {
   const { w, h } = getViewportSize();
-  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1)); // cap
+  const dpr = Math.min(2, Math.max(1, window.devicePixelRatio || 1)); // cap for performance
   canvas.style.width = w + "px";
   canvas.style.height = h + "px";
   canvas.width = Math.floor(w * dpr);
@@ -47,6 +45,11 @@ function fitCanvas() {
 window.addEventListener("resize", fitCanvas);
 window.visualViewport?.addEventListener("resize", fitCanvas);
 fitCanvas();
+
+// ---- Set HUD DOM colors to black (in case CSS is white) ----
+elScore.style.color = "#111";
+elTime.style.color  = "#111";
+elBest.style.color  = "#111";
 
 // ---- particle sprite (fast) ----
 let dotSprite = null;
@@ -58,9 +61,9 @@ function makeDotSprite() {
 
   const cx = 16, cy = 16;
   const grad = g.createRadialGradient(cx, cy, 0, cx, cy, 16);
-  grad.addColorStop(0.0, "rgba(255,255,255,1.0)");
-  grad.addColorStop(0.5, "rgba(255,255,255,0.65)");
-  grad.addColorStop(1.0, "rgba(255,255,255,0.0)");
+  grad.addColorStop(0.0, "rgba(0,0,0,0.22)");
+  grad.addColorStop(0.55, "rgba(0,0,0,0.10)");
+  grad.addColorStop(1.0, "rgba(0,0,0,0.0)");
 
   g.fillStyle = grad;
   g.beginPath();
@@ -74,9 +77,9 @@ makeDotSprite();
 const assets = {
   face: new Image(),
   faceHit: new Image(),
-  hit01: null,
-  hit02: null,
-  count: null,
+  hit01: null,   // normal hit (pool)
+  hit02: null,   // bonus hit  (pool)
+  count: null,   // countdown  (pool)
   bgm: null,
 };
 
@@ -111,6 +114,7 @@ function initAudio() {
   if (!assets.count) assets.count = makeAudioPool("./assets/count.mp3", 2, 0.75);
 }
 
+// ---- audio throttle (mobile) ----
 let lastSeTime = 0;
 function playPool(pool) {
   if (!pool) return;
@@ -135,37 +139,49 @@ function startBGM() {
   assets.bgm.play().catch(() => {});
 }
 
+// ---- best ----
 let best = Number(localStorage.getItem(BEST_KEY) || 0);
 elBest.textContent = best.toString();
 
-// ★ここが要望
+// ★intro seconds
 const INTRO_FIRST_SECONDS = 7.0;
 const INTRO_RETRY_SECONDS = 3.0;
 const GO_HOLD_SECONDS = 1.0;
+
 const GAME_SECONDS = 30.0;
+
+// ---- background (slightly darker gray) ----
+const BG_COLOR = "#d6dbe3"; // darker than previous #e9edf2
+
+// ---- HUD black-ish ----
+const HUD_FILL = "rgba(15,15,15,0.95)";
+const HUD_STROKE = "rgba(255,255,255,0.20)"; // for desktop only
 
 // 速度の上限（暴走防止）
 function speedLimit() {
   const { w, h } = getViewportSize();
   const s = Math.min(w, h);
-  return clamp(s * 0.85, 520, 900);
+  return clamp(s * 0.85, 520, 900); // px/s
 }
 
 const state = {
   running: false,
   lastT: 0,
 
+  // phase: "intro" -> "play"
   phase: "intro",
   introLeft: INTRO_FIRST_SECONDS,
   introTotal: INTRO_FIRST_SECONDS,
 
+  // countdown sound once
   countPlayed: false,
+
+  // GO hold
   goHold: 0,
 
   score: 0,
   timeLeft: GAME_SECONDS,
 
-  // pooled
   particles: [],
   floaters: [],
 
@@ -197,144 +213,42 @@ let hasStartedOnce = false;
 let scoreDirty = true;
 function markScoreDirty() { scoreDirty = true; }
 
+// ---- frame-synced hit request ----
+let hitRequested = false;
+let hitPosX = 0;
+let hitPosY = 0;
+
 // ---- rapid hit detector (for effect throttle) ----
 let lastHitPerf = 0;
 function isRapidHit() {
   const now = performance.now();
-  const rapid = (now - lastHitPerf) < 70;
+  const rapid = (now - lastHitPerf) < 80; // little looser
   lastHitPerf = now;
   return rapid;
-}
-
-// ============================
-// Input queue: pointerdown only enqueues
-// ============================
-const tapQ = {
-  x: new Float32Array(32),
-  y: new Float32Array(32),
-  head: 0,
-  tail: 0,
-  mask: 31,
-  push(px, py) {
-    const next = (this.tail + 1) & this.mask;
-    if (next === this.head) return; // full: drop
-    this.x[this.tail] = px;
-    this.y[this.tail] = py;
-    this.tail = next;
-  },
-  pop() {
-    if (this.head === this.tail) return null;
-    const px = this.x[this.head];
-    const py = this.y[this.head];
-    this.head = (this.head + 1) & this.mask;
-    return { x: px, y: py };
-  },
-  clear() { this.head = this.tail = 0; }
-};
-
-function getPointerPos(e) {
-  const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left);
-  const y = (e.clientY - rect.top);
-  return { x, y };
-}
-
-canvas.addEventListener("pointerdown", (e) => {
-  if (!state.running) return;
-  if (state.phase !== "play") return;
-  const { x, y } = getPointerPos(e);
-  tapQ.push(x, y);
-});
-
-// ============================
-// Pools (no GC burst on rapid taps)
-// ============================
-const MAX_PARTICLES = IS_MOBILE ? 64 : 220;
-const MAX_FLOATERS  = IS_MOBILE ? 18 : 40;
-
-function initPools() {
-  state.particles.length = 0;
-  for (let i = 0; i < MAX_PARTICLES; i++) {
-    state.particles.push({ alive: false, x:0, y:0, vx:0, vy:0, life:0, t:0 });
-  }
-  state.floaters.length = 0;
-  for (let i = 0; i < MAX_FLOATERS; i++) {
-    state.floaters.push({
-      alive: false,
-      text: "",
-      x0: 0, y0: 0,
-      t: 0, life: 0,
-      rise: 0, wobble: 0,
-      size: 0, weight: 0
-    });
-  }
-}
-
-function allocParticle() {
-  for (let i = 0; i < state.particles.length; i++) {
-    const p = state.particles[i];
-    if (!p.alive) return p;
-  }
-  return null;
-}
-function allocFloater() {
-  for (let i = 0; i < state.floaters.length; i++) {
-    const f = state.floaters[i];
-    if (!f.alive) return f;
-  }
-  return null;
 }
 
 function addFloater(text, x, y, opts = {}) {
   const {
     size = 26,
-    life = IS_MOBILE ? 0.55 : 0.7,
-    rise = IS_MOBILE ? 110 : 140,
-    wobble = IS_MOBILE ? 8 : 10,
-    weight = 1000,
+    life = IS_MOBILE ? 0.50 : 0.7,
+    rise = IS_MOBILE ? 90 : 130,
+    wobble = IS_MOBILE ? 6 : 10,
+    weight = 900,
   } = opts;
 
-  const ft = allocFloater();
-  if (!ft) return;
+  if (IS_MOBILE && state.floaters.length > 14) return;
 
-  ft.alive = true;
-  ft.text = text;
-  ft.x0 = x;
-  ft.y0 = y;
-  ft.t = 0;
-  ft.life = life;
-  ft.rise = rise;
-  ft.wobble = wobble;
-  ft.size = size;
-  ft.weight = weight;
-}
-
-function spawnParticles(x, y, n = 18, rapid = false) {
-  const nn = IS_MOBILE ? Math.max(3, Math.floor(n * 0.35)) : n;
-  const outN = rapid ? Math.min(6, nn) : nn;
-
-  for (let i = 0; i < outN; i++) {
-    const p = allocParticle();
-    if (!p) break;
-
-    const a = rand(0, Math.PI * 2);
-    const sp = rapid ? rand(120, 360) : rand(140, 620);
-
-    p.alive = true;
-    p.x = x; p.y = y;
-    p.vx = Math.cos(a) * sp;
-    p.vy = Math.sin(a) * sp;
-    p.life = rapid ? rand(0.14, 0.26) : rand(0.18, 0.42);
-    p.t = 0;
-  }
-}
-
-function pointInFace(px, py) {
-  const dx = px - state.face.x;
-  const dy = py - state.face.y;
-  const pad = IS_MOBILE ? 1.40 : 1.15;
-  const rr = (state.face.r * pad);
-  return (dx * dx + dy * dy) <= (rr * rr);
+  state.floaters.push({
+    text,
+    x0: x,
+    y0: y,
+    t: 0,
+    life,
+    rise,
+    wobble,
+    size,
+    weight,
+  });
 }
 
 function startFever(seconds = 7.0) {
@@ -347,12 +261,12 @@ function startFever(seconds = 7.0) {
   addFloater("FEVER x2!!", state.face.x, state.face.y - state.face.r - 12, {
     size: IS_MOBILE ? 34 : 40,
     life: 1.0,
-    rise: IS_MOBILE ? 70 : 90,
-    wobble: 20,
-    weight: 1200
+    rise: IS_MOBILE ? 60 : 80,
+    wobble: 16,
+    weight: 1000
   });
 
-  state.shake = Math.max(state.shake, IS_MOBILE ? 0.22 : 0.28);
+  state.shake = Math.max(state.shake, IS_MOBILE ? 0.20 : 0.26);
 }
 
 function stopFever() {
@@ -372,15 +286,18 @@ function resetGameForIntro(introSeconds) {
   state.score = 0;
   state.timeLeft = GAME_SECONDS;
 
-  initPools();
-  tapQ.clear();
-
+  state.particles = [];
+  state.floaters = [];
   state.shake = 0;
+
   state.combo = 0;
   state.comboTimer = 0;
   stopFever();
 
+  hitRequested = false;
+
   const { w, h } = getViewportSize();
+
   state.face.r = Math.min(w, h) * 0.10;
   state.face.x = rand(state.face.r, w - state.face.r);
   state.face.y = rand(state.face.r + 90, h - state.face.r);
@@ -399,6 +316,38 @@ function resetGameForIntro(introSeconds) {
   elScore.textContent = "0";
   elTime.textContent = GAME_SECONDS.toFixed(1);
   scoreDirty = false;
+}
+
+const MAX_PARTICLES = IS_MOBILE ? 48 : 180;
+
+function spawnParticles(x, y, n = 18, rapid = false) {
+  if (state.particles.length >= MAX_PARTICLES) return;
+
+  const nn = rapid ? Math.max(3, Math.floor(n * 0.20)) : (IS_MOBILE ? Math.max(4, Math.floor(n * 0.30)) : n);
+
+  for (let i = 0; i < nn; i++) {
+    if (state.particles.length >= MAX_PARTICLES) break;
+
+    const a = rand(0, Math.PI * 2);
+    const sp = rapid ? rand(120, 360) : rand(140, 620);
+    state.particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      life: rapid ? rand(0.12, 0.24) : rand(0.18, 0.42),
+      t: 0
+    });
+  }
+}
+
+function pointInFace(px, py) {
+  const dx = px - state.face.x;
+  const dy = py - state.face.y;
+
+  const pad = IS_MOBILE ? 1.45 : 1.15; // bigger on mobile
+  const rr = (state.face.r * pad);
+
+  return (dx * dx + dy * dy) <= (rr * rr);
 }
 
 function endGame() {
@@ -429,11 +378,11 @@ function startGame() {
   state.lastT = performance.now();
 
   addFloater("GET READY...", state.face.x, state.face.y - state.face.r - 10, {
-    size: IS_MOBILE ? 30 : 34,
+    size: IS_MOBILE ? 28 : 34,
     life: 1.0,
-    rise: 50,
-    wobble: 8,
-    weight: 1200
+    rise: 40,
+    wobble: 6,
+    weight: 1000
   });
 
   hasStartedOnce = true;
@@ -442,14 +391,30 @@ function startGame() {
 
 btn.addEventListener("click", startGame);
 
-// ============================
-// Tap processing (max 1 per frame)
-// ============================
-function processOneTap() {
-  const tap = tapQ.pop();
-  if (!tap) return;
+function getPointerPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left);
+  const y = (e.clientY - rect.top);
+  return { x, y };
+}
 
-  const { x, y } = tap;
+// pointerdown: only set request (NO heavy logic here)
+canvas.addEventListener("pointerdown", (e) => {
+  if (!state.running) return;
+  if (state.phase !== "play") return;
+
+  const { x, y } = getPointerPos(e);
+  hitRequested = true;
+  hitPosX = x;
+  hitPosY = y;
+});
+
+// ---- process hit (called from update(), once per frame at most) ----
+function processHitIfRequested() {
+  if (!hitRequested) return;
+  hitRequested = false;
+
+  const x = hitPosX, y = hitPosY;
 
   if (pointInFace(x, y)) {
     const rapid = isRapidHit();
@@ -464,34 +429,18 @@ function processOneTap() {
     state.score += add;
     markScoreDirty();
 
-    // floaters: strong throttle on rapid
-    if (!rapid) {
+    // floaters: rapid -> 2回に1回
+    if (!rapid || (state.combo % 2 === 0)) {
       addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.15, {
-        size: IS_MOBILE ? 26 : 30, life: 0.65, rise: 130, wobble: 10, weight: 1200
-      });
-    } else if ((state.combo % 3) === 0) { // rapid: 3回に1回だけ
-      addFloater(`+${add}`, state.face.x, state.face.y - state.face.r * 0.10, {
-        size: IS_MOBILE ? 22 : 26, life: 0.40, rise: 70, wobble: 6, weight: 1100
-      });
-    }
-
-    // desktop only extra text (and not rapid)
-    if (!IS_MOBILE && !rapid) {
-      const words = ["SPLASH!!", "BOON!!", "ﾍﾞﾁｬ!!"];
-      const w = words[(Math.random() * words.length) | 0];
-      addFloater(w, state.face.x, state.face.y - state.face.r - 10, {
-        size: 38, life: 0.80, rise: 120, wobble: 18, weight: 1200
+        size: IS_MOBILE ? (rapid ? 22 : 26) : (rapid ? 26 : 30),
+        life: rapid ? 0.40 : 0.65,
+        rise: rapid ? 80 : 120,
+        wobble: rapid ? 6 : 10,
+        weight: 1000
       });
     }
 
-    if (state.combo >= 3 && !IS_MOBILE && !rapid) {
-      addFloater(`${state.combo} COMBO!!`, state.face.x, state.face.y + state.face.r + 8, {
-        size: 30 + Math.min(20, state.combo * 2),
-        life: 0.60, rise: 70, wobble: 12, weight: 1200
-      });
-    }
-
-    // sound
+    // sounds
     playHitNormal();
 
     // 5 combo bonus
@@ -502,11 +451,12 @@ function processOneTap() {
 
       if (!rapid) {
         addFloater(`+${bonus} BONUS!!`, state.face.x, state.face.y, {
-          size: IS_MOBILE ? 36 : 44, life: 1.00, rise: 160, wobble: 22, weight: 1300
+          size: IS_MOBILE ? 34 : 44, life: 1.0, rise: 150, wobble: 18, weight: 1100
         });
       }
+
       playHitBonus();
-      state.shake = Math.max(state.shake, IS_MOBILE ? 0.28 : 0.35);
+      state.shake = Math.max(state.shake, IS_MOBILE ? 0.26 : 0.33);
     }
 
     // 10 combo fever
@@ -519,13 +469,12 @@ function processOneTap() {
 
     state.shake = Math.max(
       state.shake,
-      (state.fever ? (IS_MOBILE ? 0.18 : 0.22) : (IS_MOBILE ? 0.15 : 0.18)) + Math.min(0.22, state.combo * 0.012)
+      (state.fever ? (IS_MOBILE ? 0.16 : 0.20) : (IS_MOBILE ? 0.13 : 0.16)) + Math.min(0.20, state.combo * 0.010)
     );
 
-    // particles (rapid: fewer)
-    spawnParticles(state.face.x, state.face.y, 26, rapid);
+    spawnParticles(state.face.x, state.face.y, 24, rapid);
 
-    // speed growth: lower on rapid
+    // speed growth: gentle on rapid
     const mult = rapid ? rand(0.995, 1.02) : rand(0.97, 1.05);
     state.face.vx *= mult;
     state.face.vy *= mult;
@@ -548,23 +497,13 @@ function update(dt) {
       state.goHold = Math.max(0, state.goHold - dt);
       elTime.textContent = GAME_SECONDS.toFixed(1);
 
-      // update floaters
-      for (const ft of state.floaters) {
-        if (!ft.alive) continue;
-        ft.t += dt;
-        if (ft.t >= ft.life) ft.alive = false;
-      }
-
-      // update particles
-      for (const p of state.particles) {
-        if (!p.alive) continue;
+      state.floaters = state.floaters.filter(ft => (ft.t += dt) < ft.life);
+      state.particles = state.particles.filter(p => {
         p.t += dt;
-        p.x += p.vx * dt;
-        p.y += p.vy * dt;
-        p.vx *= Math.pow(0.06, dt);
-        p.vy *= Math.pow(0.06, dt);
-        if (p.t >= p.life) p.alive = false;
-      }
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        p.vx *= Math.pow(0.06, dt); p.vy *= Math.pow(0.06, dt);
+        return p.t < p.life;
+      });
 
       if (state.goHold <= 0) {
         state.phase = "play";
@@ -585,32 +524,25 @@ function update(dt) {
       state.countPlayed = true;
     }
 
-    for (const ft of state.floaters) {
-      if (!ft.alive) continue;
-      ft.t += dt;
-      if (ft.t >= ft.life) ft.alive = false;
-    }
-
-    for (const p of state.particles) {
-      if (!p.alive) continue;
+    state.floaters = state.floaters.filter(ft => (ft.t += dt) < ft.life);
+    state.particles = state.particles.filter(p => {
       p.t += dt;
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-      p.vx *= Math.pow(0.06, dt);
-      p.vy *= Math.pow(0.06, dt);
-      if (p.t >= p.life) p.alive = false;
-    }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= Math.pow(0.06, dt); p.vy *= Math.pow(0.06, dt);
+      return p.t < p.life;
+    });
 
     if (state.introLeft <= 0) {
       state.goHold = GO_HOLD_SECONDS;
       elTime.textContent = GAME_SECONDS.toFixed(1);
 
       addFloater("GO!!", state.face.x, state.face.y - state.face.r - 10, {
-        size: IS_MOBILE ? 46 : 52, life: GO_HOLD_SECONDS, rise: 140, wobble: 16, weight: 1300
+        size: IS_MOBILE ? 46 : 52, life: GO_HOLD_SECONDS, rise: 120, wobble: 12, weight: 1100
       });
 
-      state.shake = Math.max(state.shake, IS_MOBILE ? 0.18 : 0.22);
+      state.shake = Math.max(state.shake, IS_MOBILE ? 0.16 : 0.20);
     }
+
     return;
   }
 
@@ -624,8 +556,8 @@ function update(dt) {
   }
   elTime.textContent = state.timeLeft.toFixed(1);
 
-  // process at most 1 tap per frame
-  processOneTap();
+  // ★process at most 1 hit per frame
+  processHitIfRequested();
 
   const f = state.face;
   f.x += f.vx * dt;
@@ -642,21 +574,19 @@ function update(dt) {
   f.scalePop = Math.max(0, f.scalePop - dt);
   state.shake = Math.max(0, state.shake - dt);
 
-  for (const p of state.particles) {
-    if (!p.alive) continue;
+  state.particles = state.particles.filter(p => {
     p.t += dt;
     p.x += p.vx * dt;
     p.y += p.vy * dt;
     p.vx *= Math.pow(0.06, dt);
     p.vy *= Math.pow(0.06, dt);
-    if (p.t >= p.life) p.alive = false;
-  }
+    return p.t < p.life;
+  });
 
-  for (const ft of state.floaters) {
-    if (!ft.alive) continue;
+  state.floaters = state.floaters.filter(ft => {
     ft.t += dt;
-    if (ft.t >= ft.life) ft.alive = false;
-  }
+    return ft.t < ft.life;
+  });
 
   if (state.comboTimer > 0) {
     state.comboTimer = Math.max(0, state.comboTimer - dt);
@@ -681,17 +611,17 @@ function drawIntroCountdown() {
   const pulse = 1 + 0.08 * Math.sin((1 - p) * Math.PI * 6);
 
   ctx.save();
-  ctx.globalAlpha = 0.95;
+  ctx.globalAlpha = 0.98;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 
   ctx.font = `900 24px system-ui, sans-serif`;
   if (!IS_MOBILE) {
-    ctx.lineWidth = 8;
-    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = HUD_STROKE;
     ctx.strokeText("GET READY", w / 2, h / 2 - 110);
   }
-  ctx.fillStyle = "rgba(30,30,30,0.90)";
+  ctx.fillStyle = HUD_FILL;
   ctx.fillText("GET READY", w / 2, h / 2 - 110);
 
   if (waiting) { ctx.restore(); return; }
@@ -700,11 +630,11 @@ function drawIntroCountdown() {
 
   ctx.font = `${Math.floor((IS_MOBILE ? 100 : 120) * pulse)}px system-ui, sans-serif`;
   if (!IS_MOBILE) {
-    ctx.lineWidth = 14;
-    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 10;
+    ctx.strokeStyle = HUD_STROKE;
     ctx.strokeText(text, w / 2, h / 2);
   }
-  ctx.fillStyle = "rgba(30,30,30,0.90)";
+  ctx.fillStyle = HUD_FILL;
   ctx.fillText(text, w / 2, h / 2);
 
   ctx.restore();
@@ -715,7 +645,7 @@ function draw() {
 
   let ox = 0, oy = 0;
   if (state.shake > 0) {
-    const base = state.fever ? 14 : 10;
+    const base = state.fever ? 12 : 9;
     const s = state.shake * base;
     ox = rand(-s, s);
     oy = rand(-s, s);
@@ -726,27 +656,23 @@ function draw() {
 
   ctx.clearRect(-20, -20, w + 40, h + 40);
 
-  // ---- Background (pale gray) ----
-  ctx.fillStyle = "#e9edf2";
+  // background
+  ctx.fillStyle = BG_COLOR;
   ctx.fillRect(0, 0, w, h);
 
-  // ---- particles: sprite draw ----
+  // particles
   if (dotSprite) {
     for (const p of state.particles) {
-      if (!p.alive) continue;
       const a = 1 - (p.t / p.life);
       ctx.globalAlpha = a;
-
       const r = (IS_MOBILE ? 7 : 9) * a + 2;
       ctx.drawImage(dotSprite, p.x - r, p.y - r, r * 2, r * 2);
     }
     ctx.globalAlpha = 1;
   }
 
-  // ---- floaters (mobile: no stroke) ----
+  // floaters (mobile no-stroke)
   for (const ft of state.floaters) {
-    if (!ft.alive) continue;
-
     const p = ft.t / ft.life;
     const ease = 1 - Math.pow(1 - p, 3);
     const yy = ft.y0 - ft.rise * ease;
@@ -759,12 +685,11 @@ function draw() {
     ctx.textBaseline = "middle";
 
     if (!IS_MOBILE) {
-      ctx.lineWidth = 8;
-      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = HUD_STROKE;
       ctx.strokeText(ft.text, xx, yy);
     }
-
-    ctx.fillStyle = "rgba(30,30,30,0.90)";
+    ctx.fillStyle = HUD_FILL;
     ctx.fillText(ft.text, xx, yy);
   }
   ctx.globalAlpha = 1;
@@ -776,10 +701,10 @@ function draw() {
   const size = (f.r * 2) * pop;
 
   // shadow
-  ctx.globalAlpha = 0.12;
+  ctx.globalAlpha = 0.10;
   ctx.beginPath();
   ctx.ellipse(f.x, f.y + f.r * 0.78, f.r * 0.95, f.r * 0.35, 0, 0, Math.PI * 2);
-  ctx.fillStyle = "#000000";
+  ctx.fillStyle = "#000";
   ctx.fill();
   ctx.globalAlpha = 1;
 
@@ -791,21 +716,20 @@ function draw() {
   ctx.drawImage(img, f.x - size / 2, f.y - size / 2, size, size);
   ctx.restore();
 
+  // rim
   ctx.lineWidth = 4;
-  ctx.strokeStyle = "rgba(0,0,0,0.10)";
+  ctx.strokeStyle = "rgba(0,0,0,0.12)";
   ctx.beginPath();
   ctx.arc(f.x, f.y, (f.r * pop), 0, Math.PI * 2);
   ctx.stroke();
 
-  if (state.phase === "intro") {
-    drawIntroCountdown();
-  }
+  if (state.phase === "intro") drawIntroCountdown();
 
   ctx.restore();
 
-  // HUD
+  // HUD (combo/fever) black
   ctx.save();
-  ctx.globalAlpha = 0.95;
+  ctx.globalAlpha = 0.98;
   ctx.textAlign = "right";
   ctx.textBaseline = "top";
 
@@ -821,24 +745,21 @@ function draw() {
     ctx.font = font;
     if (!IS_MOBILE) {
       ctx.lineWidth = 6;
-      ctx.strokeStyle = "rgba(0,0,0,0.18)";
+      ctx.strokeStyle = HUD_STROKE;
       ctx.strokeText(text, x, y);
     }
-    ctx.fillStyle = "rgba(30,30,30,0.90)";
+    ctx.fillStyle = HUD_FILL;
     ctx.fillText(text, x, y);
   }
 
   if (state.phase === "play") {
     if (state.combo >= 2) drawHudText(`COMBO: ${state.combo}`, hudX, hudY, comboFont);
-    if (state.fever) {
-      const t = Math.max(0, state.feverTimer).toFixed(1);
-      drawHudText(`FEVER x2  ${t}s`, hudX, hudY + lineH, feverFont);
-    }
+    if (state.fever) drawHudText(`FEVER x2  ${Math.max(0, state.feverTimer).toFixed(1)}s`, hudX, hudY + lineH, feverFont);
   }
 
   ctx.restore();
 
-  // DOM update once per frame
+  // DOM score update once per frame
   if (scoreDirty) {
     elScore.textContent = String(state.score);
     scoreDirty = false;
